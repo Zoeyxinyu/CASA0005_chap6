@@ -1,0 +1,275 @@
+---
+title: "Chapter6_prac"
+author: "Xinyu"
+date: "16/12/2021"
+output: html_document
+---
+```{r library}
+# first library a few packages that we will use
+# during the practical
+library(spatstat)
+library(here)
+library(sp)
+library(rgeos)
+library(maptools)
+library(GISTools)
+library(tmap)
+library(sf)
+library(geojson)
+library(geojsonio)
+library(tmaptools)
+```
+# Setting up your data
+```{r London Borough Boundaries}
+# first, get the london borough boundaries
+LondonBoroughs <- st_read(here::here("statistical-gis-boundaries-london/ESRI/London_Borough_Excluding_MHW.shp"))
+```
+```{r pull out London}
+library(stringr)
+BoroughMap <- LondonBoroughs%>%
+  dplyr::filter(str_detect(GSS_CODE,"^E09"))%>%
+  st_transform(.,27700)
+qtm(BoroughMap)
+summary(BoroughMap)
+```
+Now get the location of all Blue Plaques in the city
+```{r get the location of Blue Plaques}
+BluePlaques <- st_read("https://s3.eu-west-2.amazonaws.com/openplaques/open-plaques-london-2018-04-08.geojson")%>%
+  st_transform(.,27700)
+summary(BluePlaques)
+```
+Plot the blue plaques in the city
+```{r plot the Blue Plaques in the city}
+#tmap_mode set to plotting
+tmap_mode("plot")
+tm_shape(BoroughMap)+
+  tm_polygons(col = NA,alpha = 0.5)+
+tm_shape(BluePlaques)+
+  tm_dots(col = "lightblue")
+```
+# Data cleaning
+There is at least one Blue Plaque that falls outside of the Borough boundaries. Errant plaques will cause problems with our analysis, so we need to clip the plaques to the boundaries.
+First we'll remove any plaques with the same grid reference as this will cause problems later on the analysis...
+```{r remove duplicates}
+library(tidyverse)
+BluePlaques <- distinct(BluePlaques)
+```
+# Spatial subsetting
+Now just select the points inside London
+```{r select points inside London}
+BluePlaquesSub <- BluePlaques[BoroughMap,]
+# check to see that they've been removed
+tmap_mode("plot")
+tm_shape(BoroughMap)+
+  tm_polygons(col = NA,alpha = 0.5)+
+tm_shape(BluePlaquesSub)+
+  tm_dots(col = "lightblue")
+```
+# Study area
+First we need to subset our sf object to pull out a borough we are interested in.
+I’m going to choose Harrow as I know there are few enough points for the analysis to definitely work. If you wish, feel free to choose another borough in London and run the same analysis, but beware that if it happens that there are a lot of blue plaques in your borough, the analysis could fall over!!
+```{r extract the borough}
+Harrow <- BoroughMap %>%
+  filter(.,NAME=="Harrow")
+# check to see that the correct borough has been pulled out
+tm_shape(Harrow)+
+  tm_polygons(col=NA,alpha = 0.5)
+```
+Now we need to clip out Blue Plaques so that we have a subset of just those that fall within the borough of interest
+```{r clip data}
+# clip the data to our sigle borough
+BluePlaquesSub <- BluePlaques[Harrow,]
+# check that it's worked
+tmap_mode("plot")
+tm_shape(Harrow)+
+  tm_polygons(col = NA,alpha = 0.5)+
+tm_shape(BluePlaquesSub)+
+  tm_dots(col = "orange")
+```
+We now have all our data so that we can start the analysis using spatstat.
+The first thing we need to do is create an observation window for spatstat to carry our its analysis within - we will set this to the extent of the Harrow boundary
+```{r set a window as the borough boundary}
+window <- as.owin(Harrow)
+plot(window)
+```
+```{r creat a ppp object}
+# create a sp object
+BluePlaquesSub <- BluePlaquesSub%>%
+  as(.,"Spatial")
+# create a ppp object
+BluePlaquesSub.ppp <- ppp(x=BluePlaquesSub@coords[,1],
+                          y=BluePlaquesSub@coords[,2],
+                          window = window)
+```
+```{r have a look at ppp object}
+BluePlaquesSub.ppp %>%
+  plot(.,pch=16,cex=0.5,
+       main="Blue Plaques Harrow")
+```
+# 6.6 point pattern analysis
+## 6.6.1 Kernel Density Estimation
+```{r KDE map}
+BluePlaquesSub.ppp%>%
+  density(.,sigma=500) %>%
+  plot()
+# the sigma value sets the diameter of the Kernel(in the units your map is in - in this case, as we are in British National Grid the units are in metres)
+```
+# 6.6.2 Quadrat Analysis
+What we are interested in is: whether the distribution of points in our study area differs from "complete spatial randomness"-CSR. ! It's different from CRS !!!!
+
+First plot the points
+```{r quadrat analysis}
+plot(BluePlaquesSub.ppp,
+     pch=16,
+     cex=0.5,
+     main="Blue Plaques in Harrow")
+# count the points in that fall in 6 x 6 grid overlaid across the window BluePlaquesSub.ppp
+BluePlaquesSub.ppp %>%
+  quadratcount(.,nx=6,ny=6)%>%
+  plot(.,add=T,col="blue")
+
+# run the quadrat count
+Qcount <- BluePlaquesSub.ppp %>%
+  quadratcount(.,nx=6,ny=6) %>%
+  as.data.frame()%>%
+  dplyr::count(Var1=Freq)%>%
+  dplyr::rename(Freqquadratcount=n)
+# check the data type in the first column
+# if it is factor we need to convert it to numeric
+Qcount%>%
+  summarise_all(class)
+
+# Now we have a frequency table. Next we need to calculate our expected values. The formula for calculating expected probabilities based on the Poisson distribution.
+sums <- Qcount %>%
+  #calculate the total blue plaques
+  mutate(total=Var1*Freqquadratcount) %>%
+  dplyr::summarise(across(everything(),sum))%>%
+  dplyr::select(-Var1)
+lambda <- Qcount%>%
+  #calculate lambda
+  mutate(total=Var1*Freqquadratcount)%>%
+  dplyr::summarise(across(everything(),sum))%>%
+  mutate(lambda=total/Freqquadratcount)%>%
+  dplyr::select(lambda)%>%
+  pull(lambda)
+#Calculate expected using the Poisson formula from above  k is the number of blue plaques counted in a square and is found in the first column of our table…
+
+QCountTable <- Qcount %>%
+  mutate(Pr=((lambda^Var1)*exp(-lambda))/factorial(Var1))%>%
+  #now calculate the expected counts based on our total number of plaques and save them to the table
+  mutate(Expected=(round(Pr*sums$Freqquadratcount,0)))
+
+# compare the frequency distributions of the observed and expected point pattern
+plot(c(1,5),c(0,14),type="n",
+     xlab="Number of Blue Plaques (Red=Observed,Blue=Expected)",
+     ylab="Frequency of Occurance")
+points(QCountTable$Freqquadratcount,
+       col="Red",type="o",lwd=3)
+points(QCountTable$Expected,col="Blue",type="o",lwd=3)
+
+```
+```{r quadrat test}
+teststats <- quadrat.test(BluePlaquesSub.ppp, nx = 6, ny = 6)
+
+plot(BluePlaquesSub.ppp,pch=16,cex=0.5, main="Blue Plaques in Harrow")
+plot(teststats, add=T, col = "red")
+```
+# Ripley's K
+```{r}
+K <- BluePlaquesSub.ppp %>%
+  Kest(., correction="border") %>%
+  plot()
+Kval <- as.data.frame(Kest(BluePlaquesSub.ppp, correction = "border"))
+```
+# Density-based spatial clustering of applications with noise: DBSCAN
+
+```{r DBSCAN}
+library(raster)
+library(fpc)
+# we will now carry out a DBSCAN analysis of blue plaques in my borough to see if there are any clusters present
+
+#first check the coordinate reference system of the Harrow spatial polygon:
+st_geometry(BoroughMap)
+#first extract the points from the spatial points data frame
+BluePlaquesSubPoints <- BluePlaquesSub %>%
+  coordinates(.)%>%
+  as.data.frame()
+
+# now run the dbscan analysis
+db <- BluePlaquesSubPoints %>%
+  fpc::dbscan(.,eps = 700,MinPts = 4)
+# now plot the results
+plot(db, BluePlaquesSubPoints, main = "DBSCAN Output", frame = F)
+plot(BoroughMap$geometry, add=T)
+
+# used to find suitable eps value based on the knee in plot
+# k is no. of nearest neighbours used,use min points
+library(dbscan)
+BluePlaquesSubPoints%>%
+  dbscan::kNNdistplot(.,k=4)
+```
+```{r use ggplot2}
+# we can always produce a much nicer plot by extracting the useful information from the DBSCAN output and use ggplot2 to produce a much cooler map
+library(ggplot2)
+db
+db$cluster
+
+# We can now add this cluster membership info back into our dataframe
+BluePlaquesSubPoints<- BluePlaquesSubPoints %>%
+  mutate(dbcluster=db$cluster)
+#Next we are going to create some convex hull polygons to wrap around the points in our clusters.
+chulls <- BluePlaquesSubPoints %>%
+  group_by(dbcluster) %>%
+  dplyr::mutate(hull = 1:n(),
+  hull = factor(hull, chull(coords.x1, coords.x2)))%>%
+  arrange(hull)
+# As 0 isn’t actually a cluster (it’s all points that aren’t in a cluster) drop it from the dataframe
+chulls <- chulls %>%
+  filter(dbcluster >=1)
+
+# Now create a ggplot2 object from our data
+dbplot <- ggplot(data=BluePlaquesSubPoints, 
+                 aes(coords.x1,coords.x2, colour=dbcluster, fill=dbcluster)) 
+#add the points in
+dbplot <- dbplot + geom_point()
+#now the convex hulls
+dbplot <- dbplot + geom_polygon(data = chulls, 
+                                aes(coords.x1,coords.x2, group=dbcluster), 
+                                alpha = 0.5) 
+#now plot, setting the coordinates to scale correctly and as a black and white plot 
+#(just for the hell of it)...
+dbplot + theme_bw() + coord_equal()
+
+###add a basemap
+##First get the bbox in lat long for Harrow
+HarrowWGSbb <- Harrow %>%
+  st_transform(., 4326)%>%
+  st_bbox()
+# Now convert the basemap to British National Grid
+
+library(OpenStreetMap)
+
+basemap <- OpenStreetMap::openmap(c(51.5549876,-0.4040502),c(51.6405356,-0.2671315),
+                         zoom=NULL,
+                         "stamen-toner")
+
+  # convert the basemap to British National Grid
+basemap_bng <- openproj(basemap, projection="+init=epsg:27700")
+
+# Now we can plot our fancy map with the clusters on…
+
+#autoplot(basemap_bng) sometimes works
+autoplot.OpenStreetMap(basemap_bng)+ 
+  geom_point(data=BluePlaquesSubPoints, 
+             aes(coords.x1,coords.x2, 
+                 colour=dbcluster, 
+                 fill=dbcluster)) + 
+  geom_polygon(data = chulls, 
+               aes(coords.x1,coords.x2, 
+                   group=dbcluster,
+                   fill=dbcluster), 
+               alpha = 0.5)  
+```
+
+
+
